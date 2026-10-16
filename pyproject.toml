@@ -23,6 +23,15 @@ dependencies = [
     "platformdirs (>=4.11.3,<5.0.0)",
 ]
 
+# Ship only portable documentation, synthetic examples and tests in the sdist.
+[tool.poetry]
+include = [
+    {path = "docs/input-format.md", format = "sdist"},
+    {path = "docs/development/README.md", format = "sdist"},
+    {path = "examples/*.py", format = "sdist"},
+    {path = "tests", format = "sdist"},
+]
+
 [tool.poetry.group.dev.dependencies]
 pre-commit = ">=4.6.2,<5.0.0"
 pytest = ">=9.1.1,<10.0.0"

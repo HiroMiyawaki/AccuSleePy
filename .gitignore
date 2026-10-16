@@ -171,3 +171,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local investigation notes, private session details and generated demos
+/docs/local/
+/demo-data/

@@ -43,8 +43,15 @@ class EpochCursor(MultiCursor):
     def __init__(self, axes):
         super().__init__(axes, color="gray", linewidth=1, alpha=0.5)
         # hide the cursor when the mouse leaves the figure
-        for canvas in self._canvas_infos:
-            canvas.mpl_connect("figure_leave_event", self.hide)
+        self._leave_connections = [
+            (canvas, canvas.mpl_connect("figure_leave_event", self.hide))
+            for canvas in self._canvas_infos
+        ]
+
+    def disconnect(self):
+        super().disconnect()
+        for canvas, cid in getattr(self, "_leave_connections", []):
+            canvas.mpl_disconnect(cid)
 
     def onmove(self, event):
         """Update the cursor to follow the mouse
@@ -116,6 +123,7 @@ class MplWidget(QtWidgets.QWidget):
 
         # upper plot references
         self.upper_marker = None
+        self.epoch_lines = []
         self.label_img_ref = None
         self.confidence_img_ref = None
         self.spec_ref = None
@@ -139,9 +147,14 @@ class MplWidget(QtWidgets.QWidget):
         self.spec_full = None
         self.confidence_img_full = None
         self.spec_extent_y = None
+        self.extra_spec_ref = None
+        self.extra_spec_full = None
+        self.extra_eeg_line = None
+        self.extra_eeg_epoch_plot = None
+        self.extra_top_marker = []
+        self.channel_selectors = []
 
-        # cached background for blitting the upper plot's epoch marker
-        self.marker_axes = None
+        # Cached static panels for blitting the selected-epoch marker and guides.
         self.marker_background = None
         self._capturing_marker_background = False
 
@@ -324,11 +337,24 @@ class MplWidget(QtWidgets.QWidget):
         # (pass only visible axes: the confidence subplot may be hidden)
         self.cursor = EpochCursor(axes=[ax for ax in axes if ax.get_visible()])
 
-        # the epoch marker has an axes to itself, so it can be redrawn
-        # without touching the rest of the figure
-        self.marker_axes = axes[2]
+        # Guides share the marker's cached redraw path during navigation.
+        self.epoch_lines = [
+            ax.axvline(
+                0.5 if ax is axes[3] else 0,
+                color="red",
+                linewidth=0.35,
+                zorder=5,
+            )
+            for ax in (axes[1], axes[3], axes[4])
+        ]
         self.marker_background = None
         self.canvas.mpl_connect("draw_event", self._discard_marker_background)
+
+    def set_selected_epoch(self, epoch):
+        """Align the fixed guides in pixel space despite the spectrum's offset."""
+        for line in self.epoch_lines:
+            x = epoch + 0.5 if line.axes in self.spectrogram_axes else epoch
+            line.set_xdata([x, x])
 
     def _discard_marker_background(self, event=None) -> None:
         """Drop the cached marker background after a full redraw
@@ -344,32 +370,26 @@ class MplWidget(QtWidgets.QWidget):
             self.marker_background = None
 
     def _capture_marker_background(self) -> None:
-        """Redraw the upper figure without its epoch marker and cache it"""
+        """Cache all upper panels without the moving marker and guide lines."""
         self._capturing_marker_background = True
         try:
-            for marker in self.upper_marker:
+            for marker in [*self.upper_marker, *self.epoch_lines]:
                 marker.set_visible(False)
             self.canvas.draw()
-            self.marker_background = self.canvas.copy_from_bbox(self.marker_axes.bbox)
+            self.marker_background = self.canvas.copy_from_bbox(self.canvas.figure.bbox)
         finally:
-            for marker in self.upper_marker:
+            for marker in [*self.upper_marker, *self.epoch_lines]:
                 marker.set_visible(True)
             self._capturing_marker_background = False
 
     def draw_upper_marker(self) -> None:
-        """Redraw the upper figure's epoch marker and nothing else
-
-        Restoring a cached background and blitting the marker's own (small)
-        axes avoids resampling the spectrogram, which dominates a full
-        redraw of a long recording. Only correct when the marker's position
-        is the sole change to the figure.
-        """
+        """Blit the selected-epoch marker and guides over the cached panels."""
         if self.marker_background is None:
             self._capture_marker_background()
         self.canvas.restore_region(self.marker_background)
-        for marker in self.upper_marker:
-            self.marker_axes.draw_artist(marker)
-        self.canvas.blit(self.marker_axes.bbox)
+        for marker in [*self.upper_marker, *self.epoch_lines]:
+            marker.axes.draw_artist(marker)
+        self.canvas.blit(self.canvas.figure.bbox)
         # the cursor blits from a background of its own, captured while the
         # marker was hidden. refresh it, or the marker jumps back to its
         # previous position the next time the mouse moves.
@@ -416,6 +436,9 @@ class MplWidget(QtWidgets.QWidget):
         # the spectrogram's x-axis is offset by 0.5 epochs from the others
         self.spec_ref.set(data=self.spec_full[:, columns])
         self.spec_ref.set_extent((left, right + 1, *self.spec_extent_y))
+        if self.extra_spec_ref is not None:
+            self.extra_spec_ref.set(data=self.extra_spec_full[:, columns])
+            self.extra_spec_ref.set_extent((left, right + 1, *self.spec_extent_y))
 
     def setup_lower_figure(
         self,
@@ -433,6 +456,11 @@ class MplWidget(QtWidgets.QWidget):
         :param brain_state_set: set of brain states options
         :param label_display_options: valid brain state y-axis locations
         """
+        self.extra_eeg_line = None
+        self.extra_eeg_epoch_plot = None
+        self.extra_top_marker = []
+        self._sampling_rate = sampling_rate
+        self._epochs_shown = epochs_to_show
         # number of samples in one epoch
         # we can expect this to be very close to an integer
         samples_per_epoch = round(sampling_rate * self.epoch_length)
@@ -460,7 +488,7 @@ class MplWidget(QtWidgets.QWidget):
         axes[0].set_yticks([])
         axes[0].set_xlim((0, samples_shown))
         axes[0].set_ylim((-1, 1))
-        axes[0].set_ylabel("EEG", rotation="horizontal", ha="right")
+        axes[0].set_ylabel("EEG", rotation="horizontal", ha="right", fontsize=8)
         self.eeg_line = axes[0].plot(
             np.zeros(samples_shown),
             "k",
@@ -504,7 +532,7 @@ class MplWidget(QtWidgets.QWidget):
         axes[1].set_yticks([])
         axes[1].set_xlim((0, samples_shown))
         axes[1].set_ylim((-1, 1))
-        axes[1].set_ylabel("EMG", rotation="horizontal", ha="right")
+        axes[1].set_ylabel("EMG", rotation="horizontal", ha="right", fontsize=8)
 
         self.emg_epoch_plot = plot_eeg_emg_epochs(
             ax=axes[1],
@@ -555,6 +583,96 @@ class MplWidget(QtWidgets.QWidget):
         )
 
         self.canvas.axes = axes
+
+    @property
+    def spectrogram_axes(self):
+        axes = [self.spec_ref.axes]
+        if self.extra_spec_ref is not None:
+            axes.append(self.extra_spec_ref.axes)
+        return axes
+
+    @property
+    def lfp_axes(self):
+        axes = [self.eeg_line.axes]
+        if self.extra_eeg_line is not None:
+            axes.append(self.extra_eeg_line.axes)
+        return axes
+
+    def add_second_spectrogram(self):
+        """Keep legacy axes indices while stacking a second synchronized spectrum."""
+        axes = self.canvas.axes
+        gs = GridSpec(6, 1, hspace=0.4, height_ratios=[2, 8, 2, 12, 12, 9])
+        for ax, row in zip(axes, [0, 1, 2, 3, 5], strict=True):
+            ax.set_subplotspec(gs[row])
+        extra = self.canvas.figure.add_subplot(gs[4])
+        extra.set_yticks(axes[3].get_yticks())
+        extra.set_yticklabels([t.get_text() for t in axes[3].get_yticklabels()])
+        extra.tick_params(axis="both", labelsize=8)
+        extra.xaxis.set_major_formatter(mticker.FuncFormatter(self.time_formatter))
+        self.extra_spec_full = self.spec_full
+        self.extra_spec_ref = extra.imshow(
+            self.spec_full,
+            aspect="auto",
+            origin="lower",
+            interpolation="None",
+            extent=self.spec_ref.get_extent(),
+            vmin=self.spec_ref.get_clim()[0],
+            vmax=self.spec_ref.get_clim()[1],
+        )
+        axes.append(extra)
+        # Disconnect both event callbacks owned by MultiCursor before replacing it.
+        limits = [ax.get_ylim() for ax in axes]
+        self.cursor.disconnect()
+        for line in [*self.cursor.vlines, *self.cursor.hlines]:
+            line.remove()
+        self.cursor = EpochCursor(axes=[ax for ax in axes if ax.get_visible()])
+        # MultiCursor creates hidden horizontal lines at the last axes' midpoint.
+        # Those lines must not autoscale an unrelated EMG axis to frequency units.
+        for ax, ylim in zip(axes, limits, strict=True):
+            ax.set_ylim(ylim)
+        axes[3].tick_params(axis="x", labelbottom=False)
+        self.epoch_lines.append(
+            extra.axvline(0.5, color="red", linewidth=0.35, zorder=5)
+        )
+
+    def set_spectrogram(self, slot, spec, name, clim=None):
+        """Update one slot without resetting the label ROI or navigation state."""
+        spec = spec[: self.spec_full.shape[0], :]
+        if slot == 0:
+            self.spec_full = spec
+            ref = self.spec_ref
+        else:
+            self.extra_spec_full = spec
+            ref = self.extra_spec_ref
+        if clim is None:
+            clim = np.nanpercentile(spec, [2, 98])
+        ref.set_data(spec)
+        ref.set_clim(*clim)
+        ref.axes.set_ylabel(name, rotation="horizontal", ha="right", fontsize=8)
+
+    def add_second_lfp(self, name):
+        axes = self.canvas.axes
+        gs = GridSpec(4, 1, hspace=0.25)
+        for ax, row in zip(axes, [0, 2, 3], strict=True):
+            ax.set_subplotspec(gs[row])
+        extra = self.canvas.figure.add_subplot(gs[1])
+        extra.set(xlim=axes[0].get_xlim(), ylim=(-1, 1), xticks=[], yticks=[])
+        extra.set_ylabel(name, rotation="horizontal", ha="right", fontsize=8)
+        self.extra_eeg_line = extra.plot([], [], "k", linewidth=0.5)[0]
+        self.extra_eeg_epoch_plot = plot_eeg_emg_epochs(
+            ax=extra,
+            samples_per_epoch=round(self._sampling_rate * self.epoch_length),
+            samples_shown=round(
+                self._sampling_rate * self.epoch_length * self._epochs_shown
+            ),
+            epochs_to_show=self._epochs_shown,
+        )
+        self.extra_eeg_epoch_plot.set_visible(False)
+        self.extra_top_marker = [
+            extra.plot(line.get_xdata(), line.get_ydata(), "r")[0]
+            for line in self.top_marker
+        ]
+        axes.append(extra)
 
     def time_formatter(self, x, pos):
         x = x * self.epoch_length

@@ -142,6 +142,7 @@ def create_spectrogram(
     epoch_length: int | float,
     time_bandwidth: int = 2,
     n_tapers: int = 3,
+    chunk_epochs: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Create an EEG spectrogram image
 
@@ -161,20 +162,46 @@ def create_spectrogram(
         [eeg[:pad_length][::-1], eeg, eeg[(len(eeg) - pad_length) :][::-1]]
     )
 
-    spec, _, f = spectrogram(
-        padded_eeg,
-        sampling_rate,
-        frequency_range=[0, SPECTROGRAM_UPPER_FREQ],
-        time_bandwidth=time_bandwidth,
-        num_tapers=n_tapers,
-        window_params=[window_length_sec, epoch_length],
-        min_nfft=0,
-        detrend_opt="off",
-        multiprocess=True,
-        plot_on=False,
-        return_fig=False,
-        verbose=False,
-    )
+    if chunk_epochs is None:
+        spec, _, f = spectrogram(
+            padded_eeg,
+            sampling_rate,
+            frequency_range=[0, SPECTROGRAM_UPPER_FREQ],
+            time_bandwidth=time_bandwidth,
+            num_tapers=n_tapers,
+            window_params=[window_length_sec, epoch_length],
+            min_nfft=0,
+            detrend_opt="off",
+            multiprocess=True,
+            plot_on=False,
+            return_fig=False,
+            verbose=False,
+        )
+    else:
+        # Keep the original window centers, tapers and FFT, but bound the
+        # temporary window-index and segment arrays for long recordings.
+        window = round(sampling_rate * window_length_sec)
+        step = round(sampling_rate * epoch_length)
+        n_windows = (len(padded_eeg) - window) // step + 1
+        blocks = []
+        for first in range(0, n_windows, chunk_epochs):
+            count = min(chunk_epochs, n_windows - first)
+            block, _, f = spectrogram(
+                padded_eeg[first * step : (first + count - 1) * step + window],
+                sampling_rate,
+                frequency_range=[0, SPECTROGRAM_UPPER_FREQ],
+                time_bandwidth=time_bandwidth,
+                num_tapers=n_tapers,
+                window_params=[window_length_sec, epoch_length],
+                min_nfft=0,
+                detrend_opt="off",
+                multiprocess=True,
+                plot_on=False,
+                return_fig=False,
+                verbose=False,
+            )
+            blocks.append(block)
+        spec = np.concatenate(blocks, axis=1)
 
     # resample frequencies for consistency
     target_frequencies = np.arange(0, SPECTROGRAM_UPPER_FREQ, 1 / MIN_WINDOW_LEN)

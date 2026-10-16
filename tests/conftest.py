@@ -32,3 +32,11 @@ def fast_hyperparameters():
         momentum=0.9,
         training_epochs=1,
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_viewer_preferences(monkeypatch, tmp_path):
+    """Viewer tests must neither read nor write the user's real resume state."""
+    monkeypatch.setattr(
+        "accusleepy.view_state.user_config_dir", lambda _: str(tmp_path / "preferences")
+    )

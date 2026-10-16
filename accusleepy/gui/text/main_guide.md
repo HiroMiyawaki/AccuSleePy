@@ -47,7 +47,10 @@ associated button, or drag/drop the file into the empty box adjacent
 to the button.
 - Recording file: a .parquet or .csv file containing one
     column of EEG data and one column of EMG data.
-    The column names must be **eeg** and **emg**.
+    The column names must be **eeg** and **emg** for automated scoring/training.
+    Manual curation also supports multiple named LFP columns and an **icemg**
+    column, with version 1 `accusleepy` Parquet timing metadata. See the
+    [manual scoring guide](manual_scoring_guide.md) for selection and saving behavior.
 - Label file: a .csv file with one column titled **brain_state**
     with entries that are either the undefined brain state (by default, this is -1)
     or one of the digits in your brain state configuration.

@@ -26,8 +26,13 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
     QMessageBox,
+    QPushButton,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -37,7 +42,13 @@ from accusleepy.constants import UNDEFINED_LABEL
 from accusleepy.fileio import EMGFilter, load_config, save_labels
 from accusleepy.gui.mplwidget import resample_x_ticks
 from accusleepy.gui.viewer_window import Ui_ViewerWindow
+from accusleepy.manual_recording import (
+    curated_label_path,
+    is_curated_label_file,
+    save_curation_metadata,
+)
 from accusleepy.signal_processing import create_spectrogram, get_emg_power
+from accusleepy.view_state import load_view_state, save_view_state
 
 # colormap for displaying brain state labels
 # the first entry represents the "undefined" state
@@ -114,6 +125,9 @@ class ManualScoringWindow(QDialog):
         sampling_rate: int | float,
         epoch_length: int | float,
         emg_filter: EMGFilter,
+        recording=None,
+        first_eeg=None,
+        recording_file="",
     ):
         """Initialize the manual scoring window
 
@@ -128,10 +142,37 @@ class ManualScoringWindow(QDialog):
         """
         super().__init__()
 
-        self.label_file = label_file
+        self.recording = recording
+        self.recording_file = recording_file or (
+            recording.source_file if recording else ""
+        )
+        self.saved_view_state = load_view_state(self.recording_file)
+        self.resume_label_source = label_file
+        if self.saved_view_state and label_file in (
+            self.saved_view_state.get("label_source"),
+            self.saved_view_state.get("label_file"),
+        ):
+            self.resume_label_source = self.saved_view_state.get(
+                "label_source", label_file
+            )
+        self.source_label_file = label_file
+        self.curation_saved = is_curated_label_file(label_file)
+        self.label_file = (
+            curated_label_path(label_file)
+            if recording and not self.curation_saved
+            else label_file
+        )
+        self.emg_mode = recording.mode if recording else "emg"
+        self.channel_cache = {}
+        self.spectrum_cache = {}
+        self.channel_clims = {}
+        self.lfp_adjustments = {}
+        self.active_lfp_slot = 0
+        self.selected_channels = list(recording.channels)[:2] if recording else []
         self.eeg = eeg
         self.emg = emg
         self.labels = labels
+        self.initial_labels = labels.copy()
         self.confidence_scores = confidence_scores
         self.sampling_rate = sampling_rate
         self.epoch_length = epoch_length
@@ -142,11 +183,22 @@ class ManualScoringWindow(QDialog):
         # initialize the UI
         self.ui = Ui_ViewerWindow()
         self.ui.setupUi(self)
+        self.emg_control_label = QLabel(
+            "icEMG" if self.emg_mode == "icemg" else "EMG", self
+        )
+        emg_index = next(
+            i
+            for i in range(self.ui.eeg_emg_buttons.count())
+            if self.ui.eeg_emg_buttons.itemAt(i).layout() == self.ui.emgbuttons
+        )
+        self.ui.eeg_emg_buttons.insertWidget(emg_index, self.emg_control_label)
         self.setWindowTitle("AccuSleePy manual scoring window")
 
         config = load_config()
         self.brain_state_set = config.brain_state_set
-        self.epochs_to_show = config.epochs_to_show
+        self.epochs_to_show = min(config.epochs_to_show, self.n_epochs)
+        if self.epochs_to_show % 2 == 0 and self.epochs_to_show > 1:
+            self.epochs_to_show -= 1
         self.autoscroll_state = config.autoscroll_state
 
         # find the set of y-axis locations of valid brain state labels
@@ -159,18 +211,28 @@ class ManualScoringWindow(QDialog):
         self.ui.upperfigure.epoch_length = self.epoch_length
         self.ui.lowerfigure.epoch_length = self.epoch_length
 
-        # get EEG spectrogram and its frequency axis
-        spectrogram, spectrogram_frequencies = create_spectrogram(
-            self.eeg, self.sampling_rate, self.epoch_length
-        )
-
-        # calculate RMS of EMG for each epoch and apply a ceiling
-        self.upper_emg = create_upper_emg_signal(
-            self.emg, self.sampling_rate, self.epoch_length, self.emg_filter
-        )
-
-        # center and scale the EEG and EMG signals to fit the display
-        self.eeg, self.emg = transform_eeg_emg(self.eeg, self.emg)
+        if self.recording:
+            for name in self.selected_channels:
+                self.lfp_adjustments[name] = [1.0, 0.0]
+            self.eeg, spectrogram, spectrogram_frequencies = self._get_channel(
+                self.selected_channels[0], first_eeg
+            )
+            if self.emg_mode == "icemg":
+                samples = round(self.sampling_rate * self.epoch_length)
+                self.upper_emg = self.emg.reshape(-1, samples).mean(axis=1)
+            else:
+                self.upper_emg = create_upper_emg_signal(
+                    self.emg, self.sampling_rate, self.epoch_length, self.emg_filter
+                )
+                _, self.emg = transform_eeg_emg(np.zeros(1), self.emg)
+        else:
+            spectrogram, spectrogram_frequencies = create_spectrogram(
+                self.eeg, self.sampling_rate, self.epoch_length
+            )
+            self.upper_emg = create_upper_emg_signal(
+                self.emg, self.sampling_rate, self.epoch_length, self.emg_filter
+            )
+            self.eeg, self.emg = transform_eeg_emg(self.eeg, self.emg)
         # only a portion will be displayed in the lower plots
         # we'll store this so that it's easy to modify
         self.eeg_shown = None
@@ -212,6 +274,23 @@ class ManualScoringWindow(QDialog):
             self.label_display_options,
         )
 
+        if self.recording:
+            upper = self.ui.upperfigure
+            if len(self.selected_channels) == 2:
+                upper.add_second_spectrogram()
+            for slot, name in enumerate(self.selected_channels):
+                _, spec, _ = self._get_channel(name)
+                upper.set_spectrogram(slot, spec, name)
+            self._setup_channel_controls()
+            self._configure_lower_channels()
+            upper.canvas.axes[4].set_ylabel(
+                self.emg_mode, rotation="horizontal", ha="right"
+            )
+            if self.emg_mode == "icemg":
+                upper.canvas.axes[4].set_ylim(self.icemg_limits)
+                upper.canvas.axes[4].set_yticks([0, 0.5, 1])
+                upper.canvas.axes[4].tick_params(axis="y", labelsize=7)
+
         # initialize values that can be changed by user input
         self.epoch = 0
         self.upper_left_epoch = 0
@@ -236,6 +315,9 @@ class ManualScoringWindow(QDialog):
         # no need to show the tip about the lower axes yet
         self.ui.reset_tip_label.setText("")
 
+        # Populate both spectra before the first draw, including the second slot.
+        if self.recording:
+            self.adjust_upper_figure_x_limits()
         # populate the lower figure
         self.update_lower_figure()
 
@@ -393,10 +475,10 @@ class ManualScoringWindow(QDialog):
         self.ui.xzoomreset.clicked.connect(partial(self.zoom_x, ZOOM_RESET))
         self.ui.autoscroll.stateChanged.connect(self.update_autoscroll_state)
         self.ui.eegzoomin.clicked.connect(
-            partial(self.update_signal_zoom, EEG_SIGNAL, ZOOM_IN)
+            partial(self._lfp_button_action, 0, "zoom", ZOOM_IN)
         )
         self.ui.eegzoomout.clicked.connect(
-            partial(self.update_signal_zoom, EEG_SIGNAL, ZOOM_OUT)
+            partial(self._lfp_button_action, 0, "zoom", ZOOM_OUT)
         )
         self.ui.emgzoomin.clicked.connect(
             partial(self.update_signal_zoom, EMG_SIGNAL, ZOOM_IN)
@@ -405,10 +487,10 @@ class ManualScoringWindow(QDialog):
             partial(self.update_signal_zoom, EMG_SIGNAL, ZOOM_OUT)
         )
         self.ui.eegshiftup.clicked.connect(
-            partial(self.update_signal_offset, EEG_SIGNAL, OFFSET_UP)
+            partial(self._lfp_button_action, 0, "offset", OFFSET_UP)
         )
         self.ui.eegshiftdown.clicked.connect(
-            partial(self.update_signal_offset, EEG_SIGNAL, OFFSET_DOWN)
+            partial(self._lfp_button_action, 0, "offset", OFFSET_DOWN)
         )
         self.ui.emgshiftup.clicked.connect(
             partial(self.update_signal_offset, EMG_SIGNAL, OFFSET_UP)
@@ -430,7 +512,128 @@ class ManualScoringWindow(QDialog):
         )
         self.ui.helpbutton.clicked.connect(self.show_user_manual)
 
+        self._restore_view_state()
         self.show()
+
+    def _save_view_state(self):
+        upper = self.ui.upperfigure
+        refs = [upper.spec_ref]
+        if upper.extra_spec_ref is not None:
+            refs.append(upper.extra_spec_ref)
+        save_view_state(
+            self.recording_file,
+            {
+                "sampling_rate": self.sampling_rate,
+                "epoch_length": self.epoch_length,
+                "n_epochs": self.n_epochs,
+                "epoch": self.epoch,
+                "upper_range": [self.upper_left_epoch, self.upper_right_epoch],
+                "lower_left": self.lower_left_epoch,
+                "epochs_to_show": self.epochs_to_show,
+                "channels": self.selected_channels,
+                "active_lfp_slot": self.active_lfp_slot,
+                "lfp_adjustments": self.lfp_adjustments,
+                "spectrum_clims": [list(ref.get_clim()) for ref in refs],
+                "eeg_scale": self.eeg_signal_scale_factor,
+                "eeg_offset": self.eeg_signal_offset,
+                "emg_scale": self.emg_signal_scale_factor,
+                "emg_offset": self.emg_signal_offset,
+                "autoscroll": self.autoscroll_state,
+                "epoch_markers": self.epoch_markers_shown,
+                "label_source": self.resume_label_source,
+                "label_file": self.label_file
+                if self.curation_saved
+                else self.source_label_file,
+            },
+        )
+
+    def _restore_view_state(self):
+        state = self.saved_view_state
+        if not state or any(
+            state.get(k) != v
+            for k, v in (
+                ("sampling_rate", self.sampling_rate),
+                ("epoch_length", self.epoch_length),
+                ("n_epochs", self.n_epochs),
+            )
+        ):
+            return
+        try:
+            epoch = state["epoch"]
+            left, right = state["upper_range"]
+            shown, lower = state["epochs_to_show"], state["lower_left"]
+            if not all(type(x) is int for x in (epoch, left, right, shown, lower)):
+                return
+            if not (
+                0 <= left <= epoch <= right < self.n_epochs
+                and 1 <= shown <= self.n_epochs
+                and 0 <= lower <= epoch < lower + shown <= self.n_epochs
+            ):
+                return
+            if self.recording:
+                for slot, name in enumerate(state.get("channels", [])):
+                    if (
+                        slot < len(self.selected_channels)
+                        and name in self.recording.channels
+                    ):
+                        self.ui.upperfigure.channel_selectors[slot].setCurrentText(name)
+                for name, pair in state.get("lfp_adjustments", {}).items():
+                    if name in self.recording.channels and self._valid_adjustment(pair):
+                        self.lfp_adjustments[name] = list(pair)
+            self.epoch = epoch
+            self.epochs_to_show = shown
+            self.lower_left_epoch, self.lower_right_epoch = lower, lower + shown - 1
+            self.upper_left_epoch, self.upper_right_epoch = left, right
+            self.ui.shownepochslabel.setText(str(shown))
+            self.ui.lowerfigure.canvas.figure.clf()
+            self.ui.lowerfigure.setup_lower_figure(
+                self.label_img,
+                self.sampling_rate,
+                shown,
+                self.brain_state_set,
+                self.label_display_options,
+            )
+            if self.recording:
+                self._configure_lower_channels()
+            elif self._valid_adjustment(
+                [state.get("eeg_scale"), state.get("eeg_offset")]
+            ):
+                self.eeg_signal_scale_factor = state["eeg_scale"]
+                self.eeg_signal_offset = state["eeg_offset"]
+            if self._valid_adjustment(
+                [state.get("emg_scale"), state.get("emg_offset")]
+            ):
+                self.emg_signal_scale_factor = state["emg_scale"]
+                self.emg_signal_offset = state["emg_offset"]
+            refs = [self.ui.upperfigure.spec_ref, self.ui.upperfigure.extra_spec_ref]
+            for ref, clim in zip(refs, state.get("spectrum_clims", []), strict=False):
+                if (
+                    ref is not None
+                    and len(clim) == 2
+                    and np.isfinite(clim).all()
+                    and clim[0] < clim[1]
+                ):
+                    ref.set_clim(*clim)
+            active = state.get("active_lfp_slot", 0)
+            if type(active) is int and 0 <= active < max(
+                1, len(self.selected_channels)
+            ):
+                self.active_lfp_slot = active
+            self.epoch_markers_shown = bool(state.get("epoch_markers", False))
+            self.ui.autoscroll.setChecked(
+                bool(state.get("autoscroll", self.autoscroll_state))
+            )
+            self.update_figures()
+        except (KeyError, TypeError, ValueError, IndexError):
+            # Malformed preferences must never prevent access to a recording.
+            return
+
+    @staticmethod
+    def _valid_adjustment(pair):
+        try:
+            return len(pair) == 2 and bool(np.isfinite(pair).all()) and pair[0] > 0
+        except (TypeError, ValueError):
+            return False
 
     def add_to_history(self, state_change: StateChange) -> None:
         """Add an event to the history of changes to brain state labels
@@ -525,6 +728,9 @@ class ManualScoringWindow(QDialog):
                 event.accept()
             else:
                 event.ignore()
+                return
+        self._save_view_state()
+        event.accept()
 
     def show_user_manual(self) -> None:
         """Show a popup window with the user manual"""
@@ -644,21 +850,233 @@ class ManualScoringWindow(QDialog):
         self.ui.upperfigure.canvas.draw()
         self.ui.upperfigure.roi.set_active(True)
 
+    @property
+    def eeg_signal_scale_factor(self):
+        if self.recording:
+            return self.lfp_adjustments[self.selected_channels[self.active_lfp_slot]][0]
+        return self._eeg_scale
+
+    @eeg_signal_scale_factor.setter
+    def eeg_signal_scale_factor(self, value):
+        if self.recording:
+            self.lfp_adjustments[self.selected_channels[self.active_lfp_slot]][0] = (
+                value
+            )
+        else:
+            self._eeg_scale = value
+
+    @property
+    def eeg_signal_offset(self):
+        if self.recording:
+            return self.lfp_adjustments[self.selected_channels[self.active_lfp_slot]][1]
+        return self._eeg_offset
+
+    @eeg_signal_offset.setter
+    def eeg_signal_offset(self, value):
+        if self.recording:
+            self.lfp_adjustments[self.selected_channels[self.active_lfp_slot]][1] = (
+                value
+            )
+        else:
+            self._eeg_offset = value
+
+    def _lfp_button_action(self, slot, action, direction, checked=False):
+        """Each button group always targets its own displayed LFP slot."""
+        if self.recording:
+            self.active_lfp_slot = slot
+        if action == "zoom":
+            self.update_signal_zoom(EEG_SIGNAL, direction)
+        else:
+            self.update_signal_offset(EEG_SIGNAL, direction)
+
+    def _setup_channel_controls(self):
+        selectors = QVBoxLayout()
+        for slot, name in enumerate(self.selected_channels):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"Ch{slot + 1}", self))
+            combo = QComboBox(self)
+            combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            combo.addItems(list(self.recording.channels))
+            combo.setCurrentText(name)
+            combo.setToolTip(f"LFP displayed in slot {slot + 1}")
+            combo.currentTextChanged.connect(partial(self.select_channel, slot))
+            row.addWidget(combo)
+            selectors.addLayout(row)
+            self.ui.upperfigure.channel_selectors.append(combo)
+        layout = self.ui.zoom_and_brightness
+        zoom_index = next(
+            i
+            for i in range(layout.count())
+            if layout.itemAt(i).layout() == self.ui.zoom_buttons
+        )
+        layout.insertLayout(zoom_index + 1, selectors)
+        self.channel_selector_layout = selectors
+
+        self.lfp_control_labels = []
+        first = {
+            "zoom_in": self.ui.eegzoomin,
+            "zoom_out": self.ui.eegzoomout,
+            "pan_up": self.ui.eegshiftup,
+            "pan_down": self.ui.eegshiftdown,
+        }
+        self.lfp_buttons = [first]
+        title = QLabel(f"Ch1: {self.selected_channels[0]}", self)
+        self.lfp_control_labels.append(title)
+        self.ui.eeg_emg_buttons.insertWidget(0, title)
+        if len(self.selected_channels) < 2:
+            return
+        group = QVBoxLayout()
+        group.setSpacing(2)
+        title = QLabel(f"Ch2: {self.selected_channels[1]}", self)
+        self.lfp_control_labels.append(title)
+        group.addWidget(title)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(self.ui.eegbuttons.horizontalSpacing())
+        grid.setVerticalSpacing(self.ui.eegbuttons.verticalSpacing())
+        buttons = {}
+        for key, template, row, col, action, direction in (
+            ("zoom_in", self.ui.eegzoomin, 0, 0, "zoom", ZOOM_IN),
+            ("zoom_out", self.ui.eegzoomout, 1, 0, "zoom", ZOOM_OUT),
+            ("pan_up", self.ui.eegshiftup, 0, 1, "offset", OFFSET_UP),
+            ("pan_down", self.ui.eegshiftdown, 1, 1, "offset", OFFSET_DOWN),
+        ):
+            button = QPushButton(self)
+            button.setObjectName(f"lfp2_{key}")
+            button.setIcon(template.icon())
+            button.setIconSize(template.iconSize())
+            button.setSizePolicy(template.sizePolicy())
+            button.setStyleSheet(template.styleSheet())
+            button.setAutoRepeat(template.autoRepeat())
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setToolTip(f"Ch2: {key.replace('_', ' ')}")
+            button.clicked.connect(
+                partial(self._lfp_button_action, 1, action, direction)
+            )
+            grid.addWidget(button, row, col)
+            buttons[key] = button
+        group.addLayout(grid)
+        self.ui.eeg_emg_buttons.insertLayout(2, group)
+        self.lfp_buttons.append(buttons)
+
+    def _get_channel(self, name, raw=None):
+        if name not in self.channel_cache:
+            if raw is None:
+                raw = self.recording.channels[name]
+            if not np.isfinite(raw).all():
+                raise ValueError(f"LFP {name} contains missing or infinite values")
+            if name not in self.spectrum_cache:
+                self.spectrum_cache[name] = create_spectrogram(
+                    raw, self.sampling_rate, self.epoch_length, chunk_epochs=512
+                )
+            spec, f = self.spectrum_cache[name]
+            if spec.shape[1] != self.n_epochs:
+                raise ValueError("Spectrogram length does not match labels")
+            # One fixed auto scale per channel, independent of the visible time range.
+            center = np.mean(raw)
+            sample = raw[:: max(1, len(raw) // 1_000_000)]
+            scale = np.percentile(np.abs(sample - center), 98)
+            normalized = (raw - center) / (scale * 2.2 if scale > 0 else 1)
+            self.channel_cache[name] = (normalized, spec, f)
+            self.lfp_adjustments.setdefault(name, [1.0, 0.0])
+        return self.channel_cache[name]
+
+    def select_channel(self, slot, name):
+        """Replace only one display slot; preserve labels, history and time range."""
+        previous = self.selected_channels[slot]
+        try:
+            data, spec, _ = self._get_channel(name)
+        except Exception as exc:
+            selector = self.ui.upperfigure.channel_selectors[slot]
+            selector.blockSignals(True)
+            selector.setCurrentText(previous)
+            selector.blockSignals(False)
+            QMessageBox.warning(self, "Cannot display channel", str(exc))
+            return
+        refs = [self.ui.upperfigure.spec_ref, self.ui.upperfigure.extra_spec_ref]
+        self.channel_clims[previous] = refs[slot].get_clim()
+        self.selected_channels[slot] = name
+        self.lfp_control_labels[slot].setText(f"Ch{slot + 1}: {name}")
+        for cached_name in list(self.channel_cache):
+            if cached_name not in self.selected_channels:
+                del self.channel_cache[cached_name]
+        self.active_lfp_slot = slot
+        if slot == 0:
+            self.eeg = data
+        self.ui.upperfigure.set_spectrogram(
+            slot, spec, name, self.channel_clims.get(name)
+        )
+        self.ui.lowerfigure.lfp_axes[slot].set_ylabel(
+            name, rotation="horizontal", ha="right", fontsize=8
+        )
+        self.adjust_upper_figure_x_limits()
+        self.ui.upperfigure.canvas.draw()
+        self.update_lower_figure()
+
+    def _configure_lower_channels(self):
+        lower = self.ui.lowerfigure
+        lower.canvas.axes[0].set_ylabel(
+            self.selected_channels[0], rotation="horizontal", ha="right", fontsize=8
+        )
+        if len(self.selected_channels) == 2:
+            lower.add_second_lfp(self.selected_channels[1])
+        if self.emg_mode == "icemg":
+            ax = lower.canvas.axes[1]
+            finite = self.emg[np.isfinite(self.emg)]
+            lo, hi = (
+                (min(0, float(finite.min())), max(1, float(finite.max())))
+                if len(finite)
+                else (0, 1)
+            )
+            ax.set_ylim(lo, hi)
+            self.icemg_limits = (lo, hi)
+            ax.set_yticks([lo, hi])
+            ax.tick_params(axis="y", labelsize=7)
+            ax.set_ylabel("icEMG", rotation="horizontal", ha="right", fontsize=8)
+            lower.emg_line.set_drawstyle("steps-post")
+            # Keep the existing epoch brackets inside the new physical-value axis.
+            for line in lower.bottom_marker:
+                line.set_ydata(lo + (np.asarray(line.get_ydata()) + 1) * (hi - lo) / 2)
+
     def save(self) -> None:
         """Save brain state labels to file"""
-        save_labels(self.labels, self.label_file)
+        try:
+            if self.recording and not self.curation_saved:
+                # Another viewer may have saved since this window was opened.
+                self.label_file = curated_label_path(self.source_label_file)
+                self.setWindowTitle(f"AccuSleePy viewer: {self.label_file}")
+            save_labels(self.labels, self.label_file)
+            if self.recording:
+                save_curation_metadata(
+                    self.label_file,
+                    self.labels,
+                    self.recording.metadata,
+                    self.epoch_length,
+                    self.source_label_file,
+                    {b.name: b.digit for b in self.brain_state_set.brain_states}
+                    | {"undefined": UNDEFINED_LABEL},
+                    self.initial_labels,
+                    self.recording.source_file,
+                )
+                self.curation_saved = True
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Could not save labels", str(exc))
+            return
         self.last_saved_labels = copy.deepcopy(self.labels)
+        self._save_view_state()
 
     def update_spectrogram_brightness(self, direction: str) -> None:
         """Modify spectrogram color range based on button press
 
         :param direction: brighter or dimmer
         """
-        vmin, vmax = self.ui.upperfigure.spec_ref.get_clim()
+        ref = self.ui.upperfigure.spec_ref
+        if self.recording and self.active_lfp_slot == 1:
+            ref = self.ui.upperfigure.extra_spec_ref
+        vmin, vmax = ref.get_clim()
         if direction == BRIGHTER:
-            self.ui.upperfigure.spec_ref.set(clim=(vmin, vmax * BRIGHTER_SCALE_FACTOR))
+            ref.set(clim=(vmin, vmax * BRIGHTER_SCALE_FACTOR))
         else:
-            self.ui.upperfigure.spec_ref.set(clim=(vmin, vmax * DIMMER_SCALE_FACTOR))
+            ref.set(clim=(vmin, vmax * DIMMER_SCALE_FACTOR))
         self.ui.upperfigure.canvas.draw()
 
     def update_epochs_shown(self, direction: str) -> None:
@@ -674,6 +1092,8 @@ class ManualScoringWindow(QDialog):
         # if we are near the beginning or end of the recording, we need
         # to change the epoch range differently.
         if direction == DIRECTION_PLUS:
+            if self.epochs_to_show + 2 > self.n_epochs:
+                return
             self.epochs_to_show += 2
             if self.lower_left_epoch == 0:
                 self.lower_right_epoch += 2
@@ -704,12 +1124,31 @@ class ManualScoringWindow(QDialog):
             self.brain_state_set,
             self.label_display_options,
         )
+        if self.recording:
+            self._configure_lower_channels()
         self.update_figures()
         # upper plot x limits might need to change
         self.zoom_x(direction=None)
 
     def _refresh_eeg_line(self) -> None:
         """Recompute and update the displayed EEG line."""
+        if self.recording:
+            lower = self.ui.lowerfigure
+            first = round(
+                self.lower_left_epoch * self.sampling_rate * self.epoch_length
+            )
+            last = round(
+                (self.lower_right_epoch + 1) * self.sampling_rate * self.epoch_length
+            )
+            lines = [lower.eeg_line, lower.extra_eeg_line]
+            for slot, name in enumerate(self.selected_channels):
+                values = self.channel_cache[name][0][first:last]
+                scale, offset = self.lfp_adjustments[name]
+                x, y = decimate_for_display(
+                    values * scale + offset, round(lower.lfp_axes[slot].bbox.width)
+                )
+                lines[slot].set_data(x, y)
+            return
         adjusted = (
             self.eeg_shown * self.eeg_signal_scale_factor + self.eeg_signal_offset
         )
@@ -720,6 +1159,24 @@ class ManualScoringWindow(QDialog):
 
     def _refresh_emg_line(self) -> None:
         """Recompute and update the displayed EMG line."""
+        if self.emg_mode == "icemg":
+            # Select every transition, including NaN boundaries, without averaging.
+            a = self.emg_shown
+            changes = (
+                np.flatnonzero(
+                    (a[1:] != a[:-1]) & ~(np.isnan(a[1:]) & np.isnan(a[:-1]))
+                )
+                + 1
+            )
+            indices = np.unique(np.r_[0, changes, len(a) - 1])
+            self.ui.lowerfigure.emg_line.set_data(indices, a[indices])
+            # Manual zoom/pan operates on the viewport, not on the stored values.
+            scale = self.emg_signal_scale_factor
+            base_lo, base_hi = self.icemg_limits
+            center = (base_hi + base_lo) / 2 - self.emg_signal_offset
+            half = (base_hi - base_lo) / (2 * scale)
+            self.ui.lowerfigure.canvas.axes[1].set_ylim(center - half, center + half)
+            return
         adjusted = (
             self.emg_shown * self.emg_signal_scale_factor + self.emg_signal_offset
         )
@@ -776,9 +1233,8 @@ class ManualScoringWindow(QDialog):
             self.ui.upperfigure.canvas.axes[i].set_xlim(
                 (self.upper_left_epoch - 0.5, self.upper_right_epoch + 0.5)
             )
-        self.ui.upperfigure.canvas.axes[3].set_xlim(
-            (self.upper_left_epoch, self.upper_right_epoch + 1)
-        )
+        for ax in self.ui.upperfigure.spectrogram_axes:
+            ax.set_xlim((self.upper_left_epoch, self.upper_right_epoch + 1))
 
     def zoom_x(self, direction: str | None) -> None:
         """Change upper figure x-axis zoom level
@@ -923,6 +1379,7 @@ class ManualScoringWindow(QDialog):
             ]
         )
         self.ui.upperfigure.upper_marker[1].set_xdata([self.epoch])
+        self.ui.upperfigure.set_selected_epoch(self.epoch)
 
     def update_lower_epoch_marker(self) -> None:
         """Update location of the lower figure's epoch marker"""
@@ -942,6 +1399,12 @@ class ManualScoringWindow(QDialog):
         self.ui.lowerfigure.bottom_marker[0].set_xdata([marker_left, marker_left])
         self.ui.lowerfigure.bottom_marker[1].set_xdata([marker_left, marker_right])
         self.ui.lowerfigure.bottom_marker[2].set_xdata([marker_right, marker_right])
+        for line, primary in zip(
+            self.ui.lowerfigure.extra_top_marker,
+            self.ui.lowerfigure.top_marker,
+            strict=False,
+        ):
+            line.set_xdata(primary.get_xdata())
 
     def update_figures(self, upper_marker_only: bool = False) -> None:
         """Update and redraw both figures
@@ -1002,6 +1465,10 @@ class ManualScoringWindow(QDialog):
 
         self.ui.lowerfigure.eeg_epoch_plot.set(visible=self.epoch_markers_shown)
         self.ui.lowerfigure.emg_epoch_plot.set(visible=self.epoch_markers_shown)
+        if self.ui.lowerfigure.extra_eeg_epoch_plot is not None:
+            self.ui.lowerfigure.extra_eeg_epoch_plot.set(
+                visible=self.epoch_markers_shown
+            )
 
         self.ui.lowerfigure.canvas.draw()
 
@@ -1021,12 +1488,12 @@ class ManualScoringWindow(QDialog):
         # get click location
         x = event.xdata
         # if it's a real click, and not one we simulated
-        if event.inaxes is not None:
-            # if it's on the spectrogram, we have to adjust it slightly
-            # since that uses a different x-axis range
-            ax_index = self.ui.upperfigure.canvas.axes.index(event.inaxes)
-            if ax_index == 3:
-                x -= 0.5
+        if event.inaxes in self.ui.upperfigure.spectrogram_axes:
+            if self.recording:
+                self.active_lfp_slot = self.ui.upperfigure.spectrogram_axes.index(
+                    event.inaxes
+                )
+            x -= 0.5
 
         # get the "zoom level" so we can preserve that
         upper_epochs_shown = self.upper_right_epoch - self.upper_left_epoch + 1
@@ -1071,7 +1538,9 @@ class ManualScoringWindow(QDialog):
 
         if canvas == "upper":
             self.zoom_x(direction=direction)
-        elif event.inaxes == self.ui.lowerfigure.canvas.axes[0]:
+        elif event.inaxes in self.ui.lowerfigure.lfp_axes:
+            if self.recording:
+                self.active_lfp_slot = self.ui.lowerfigure.lfp_axes.index(event.inaxes)
             self.update_signal_zoom(EEG_SIGNAL, direction)
         elif event.inaxes == self.ui.lowerfigure.canvas.axes[1]:
             self.update_signal_zoom(EMG_SIGNAL, direction)
@@ -1089,12 +1558,17 @@ class ManualScoringWindow(QDialog):
             self.epoch_markers_shown = not self.epoch_markers_shown
             self.ui.lowerfigure.eeg_epoch_plot.set(visible=self.epoch_markers_shown)
             self.ui.lowerfigure.emg_epoch_plot.set(visible=self.epoch_markers_shown)
+            if self.ui.lowerfigure.extra_eeg_epoch_plot is not None:
+                self.ui.lowerfigure.extra_eeg_epoch_plot.set(
+                    visible=self.epoch_markers_shown
+                )
             self.ui.lowerfigure.canvas.draw()
             return
 
         # only process LMB clicks on the EEG/EMG axes
         if event.button != 1 or (
-            event.inaxes not in self.ui.lowerfigure.canvas.axes[0:2]
+            event.inaxes
+            not in [*self.ui.lowerfigure.lfp_axes, self.ui.lowerfigure.canvas.axes[1]]
             and event.name == "button_press_event"
         ):
             return
@@ -1102,6 +1576,8 @@ class ManualScoringWindow(QDialog):
         if event.name == "button_press_event":
             # button press sets the current axes, y location
             self.drag_axes = event.inaxes
+            if self.recording and event.inaxes in self.ui.lowerfigure.lfp_axes:
+                self.active_lfp_slot = self.ui.lowerfigure.lfp_axes.index(event.inaxes)
             self.last_y = event.ydata
             self.ui.reset_tip_label.setText("")
         else:
@@ -1115,7 +1591,7 @@ class ManualScoringWindow(QDialog):
 
         # double click resets plot to original conditions
         if event.dblclick:
-            if event.inaxes == self.ui.lowerfigure.canvas.axes[0]:
+            if event.inaxes in self.ui.lowerfigure.lfp_axes:
                 self.eeg_signal_offset = 0
                 self.eeg_signal_scale_factor = 1
                 self._refresh_eeg_line()
@@ -1139,7 +1615,7 @@ class ManualScoringWindow(QDialog):
         self.last_y = event.ydata
 
         # update y offset for the selected plot
-        if event.inaxes == self.ui.lowerfigure.canvas.axes[0]:
+        if event.inaxes in self.ui.lowerfigure.lfp_axes:
             self.eeg_signal_offset += y_diff
             self._refresh_eeg_line()
         else:

@@ -42,6 +42,30 @@ etc.)
 There have been issues reported with installing pytorch on M1 Macs. Please contact us if you have trouble with this.
 
 
+## Multi-channel manual curation (this development branch)
+
+This checkout adds up to two vertically stacked LFP spectra/waveforms, selectable
+from multiple signal columns, and direct display of an `icemg` column. Existing
+`eeg`/`emg` recordings and scoring shortcuts are preserved. Edited labels retain
+integer master-clock intervals, and viewer settings can be resumed per recording.
+These additions are for manual curation; automatic scoring/training keeps its
+existing input format. They are not yet part of the upstream PyPI release.
+
+See [portable setup and validation](docs/development/README.md),
+[the input format](docs/input-format.md), and the
+[manual scoring guide](accusleepy/gui/text/manual_scoring_guide.md).
+A small synthetic dataset can be created after installing this checkout:
+
+```sh
+python examples/create_demo_recording.py demo-data
+python -m accusleepy
+```
+
+Select `demo-data/demo.multilfp.parquet` and `demo-data/demo.labels.csv` in the
+main window. The timing metadata sets 250 Hz and one-second epochs. No experimental
+data is included. Original labels are copied to a curated output on first save;
+reopening that curated CSV updates the same file and its sidecars.
+
 ## Usage
 
 `python -m accusleepy` will open the primary interface.

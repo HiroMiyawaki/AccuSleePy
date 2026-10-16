@@ -45,7 +45,6 @@ from accusleepy.fileio import (
     get_version,
     load_config,
     load_labels,
-    load_recording,
 )
 from accusleepy.gui.dialogs import select_existing_file, select_save_location
 from accusleepy.gui.manual_scoring import ManualScoringWindow
@@ -53,6 +52,7 @@ from accusleepy.gui.palettes import page_stylesheet, primary_window_palette
 from accusleepy.gui.primary_window import Ui_PrimaryWindow
 from accusleepy.gui.recording_manager import RecordingListManager
 from accusleepy.gui.settings_widget import SettingsWidget
+from accusleepy.manual_recording import load_manual_recording
 from accusleepy.services import (
     LoadedModel,
     TrainingService,
@@ -61,7 +61,12 @@ from accusleepy.services import (
     score_recording_list,
 )
 from accusleepy.signal_processing import resample_and_standardize
-from accusleepy.validation import check_config_consistency, validate_and_correct_labels
+from accusleepy.validation import (
+    check_config_consistency,
+    check_label_validity,
+    validate_and_correct_labels,
+)
+from accusleepy.view_state import load_view_state
 
 logger = logging.getLogger(__name__)
 
@@ -415,36 +420,35 @@ class AccuSleepWindow(QMainWindow):
         :param status_widget: UI element on which to display error messages
         :return: EEG data, EMG data, sampling rate, process completion
         """
-        error_message = check_single_file_inputs(
-            self.recording_manager.current, self.epoch_length
-        )
-        if error_message:
-            status_widget.setText(error_message)
-            self.show_message(f"ERROR: {error_message}")
-            return None, None, None, False
-
+        self.view_recording = None
         try:
-            eeg, emg = load_recording(self.recording_manager.current.recording_file)
-        except Exception:
-            logger.exception(
-                "Failed to load %s",
-                self.recording_manager.current.recording_file,
+            recording = self.recording_manager.current
+            view = load_manual_recording(
+                recording.recording_file, recording.sampling_rate, self.epoch_length
             )
+            if view.metadata:
+                self.ui.sampling_rate_input.setValue(view.sampling_rate)
+                self.ui.epoch_length_input.setValue(view.epoch_length)
+            error_message = check_single_file_inputs(recording, self.epoch_length)
+            if error_message:
+                raise ValueError(error_message)
+            eeg = view.channels[next(iter(view.channels))]
+            if not np.isfinite(eeg).all():
+                raise ValueError("LFP contains missing or infinite values")
+            emg, sampling_rate = view.emg, view.sampling_rate
+            if not view.strict:
+                eeg, emg, sampling_rate = resample_and_standardize(
+                    eeg=eeg,
+                    emg=emg,
+                    sampling_rate=sampling_rate,
+                    epoch_length=self.epoch_length,
+                )
+            self.view_recording = view
+        except Exception as exc:
+            logger.exception("Failed to load recording")
             status_widget.setText("could not load recording")
-            self.show_message(
-                "ERROR: could not load recording. "
-                "Check user manual for formatting instructions."
-            )
+            self.show_message(f"ERROR: could not load recording: {exc}")
             return None, None, None, False
-
-        sampling_rate = self.recording_manager.current.sampling_rate
-
-        eeg, emg, sampling_rate = resample_and_standardize(
-            eeg=eeg,
-            emg=emg,
-            sampling_rate=sampling_rate,
-            epoch_length=self.epoch_length,
-        )
 
         return eeg, emg, sampling_rate, True
 
@@ -496,6 +500,19 @@ class AccuSleepWindow(QMainWindow):
         # if the labels exist, load them
         # otherwise, create a blank set of labels
         label_file = self.recording_manager.current.label_file
+        state = load_view_state(self.recording_manager.current.recording_file)
+        if (
+            state
+            and state.get("sampling_rate") == sampling_rate
+            and state.get("epoch_length") == self.epoch_length
+            and state.get("n_epochs")
+            == round(eeg.size / (sampling_rate * self.epoch_length))
+            and label_file in (state.get("label_source"), state.get("label_file"))
+            and isinstance(state.get("label_file"), str)
+            and os.path.isfile(state["label_file"])
+        ):
+            label_file = state["label_file"]
+            self.show_message(f"Resuming saved labels from {label_file}")
         if os.path.isfile(label_file):
             try:
                 labels, confidence_scores = load_labels(label_file)
@@ -515,6 +532,23 @@ class AccuSleepWindow(QMainWindow):
             # manual scoring will not add a new confidence score column
             # to a label file that does not have one
             confidence_scores = None
+
+        view = self.view_recording
+        if view.strict:
+            error = check_label_validity(
+                labels,
+                confidence_scores,
+                eeg.size,
+                sampling_rate,
+                self.epoch_length,
+                self.config.brain_state_set,
+            )
+            if confidence_scores is not None and len(confidence_scores) != len(labels):
+                error = "Confidence length does not match labels"
+            if error:
+                self.ui.manual_scoring_status.setText("invalid label file")
+                self.show_message(f"ERROR: {error}; no automatic correction applied")
+                return
 
         # check that labels are valid and correct minor length mismatches
         labels, confidence_scores, validation_message = validate_and_correct_labels(
@@ -536,17 +570,32 @@ class AccuSleepWindow(QMainWindow):
         self.ui.manual_scoring_status.setText("file is open")
 
         # launch the manual scoring window
-        manual_scoring_window = ManualScoringWindow(
-            eeg=eeg,
-            emg=emg,
-            label_file=label_file,
-            labels=labels,
-            confidence_scores=confidence_scores,
-            sampling_rate=sampling_rate,
-            epoch_length=self.epoch_length,
-            emg_filter=self.config.emg_filter,
+        try:
+            manual_scoring_window = ManualScoringWindow(
+                eeg=eeg,
+                emg=emg,
+                label_file=label_file,
+                labels=labels,
+                confidence_scores=confidence_scores,
+                sampling_rate=sampling_rate,
+                epoch_length=self.epoch_length,
+                emg_filter=self.config.emg_filter,
+                recording=view if view.strict else None,
+                first_eeg=eeg,
+                recording_file=self.recording_manager.current.recording_file,
+            )
+        except Exception as exc:
+            logger.exception("Failed to initialize manual scoring")
+            self.ui.manual_scoring_status.setText("could not display recording")
+            self.show_message(f"ERROR: could not display recording: {exc}")
+            return
+        manual_scoring_window.setWindowTitle(
+            f"AccuSleePy viewer: {manual_scoring_window.label_file}"
         )
-        manual_scoring_window.setWindowTitle(f"AccuSleePy viewer: {label_file}")
+        if view.strict:
+            self.show_message(
+                f"Edited labels will be saved to {manual_scoring_window.label_file}"
+            )
         manual_scoring_window.exec()
         self.ui.manual_scoring_status.setText("")
 

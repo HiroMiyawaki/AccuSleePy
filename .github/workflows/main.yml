@@ -3,6 +3,7 @@ name: Python application
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
   pull_request:
     branches: [ "main" ]
 
@@ -11,14 +12,24 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
 
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
         python-version: [ "3.11", "3.12", "3.13", "3.14" ]
 
     steps:
     - name: Free disk space
+      if: runner.os == 'Linux'
       run: |
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /usr/local/lib/android
@@ -29,7 +40,7 @@ jobs:
     - uses: actions/checkout@v6
 
     - name: Install poetry
-      run: pipx install poetry
+      run: python -m pip install poetry
 
     - uses: actions/setup-python@v6
       with:
@@ -40,6 +51,7 @@ jobs:
       run: poetry config virtualenvs.in-project false
 
     - name: Install system deps for PySide6
+      if: runner.os == 'Linux'
       run: |
         sudo apt-get update
         sudo apt-get install -y libegl1-mesa-dev
@@ -47,7 +59,9 @@ jobs:
         sudo rm -rf /var/lib/apt/lists/*
 
     - name: Install dependencies
-      run: poetry install --no-interaction
+      run: |
+        poetry env use python
+        poetry install --no-interaction
 
     - name: Lint with ruff
       run: poetry run ruff check
@@ -56,4 +70,12 @@ jobs:
       run: poetry run ruff format --check
 
     - name: Run tests
+      env:
+        MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
       run: poetry run pytest
+
+    - name: Create portable demo recording
+      run: poetry run python examples/create_demo_recording.py demo-data
+
+    - name: Build wheel and source distribution
+      run: poetry build
